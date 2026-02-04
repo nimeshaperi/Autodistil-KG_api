@@ -1,0 +1,22 @@
+[tool.poetry]
+name = "kg-pipeline-api"
+version = "0.1.0"
+description = "FastAPI server and WebSocket API for Autodistil-KG pipelines"
+readme = "README.md"
+packages = [{include = "autodistilkg_api", from = "src"}]
+
+[tool.poetry.dependencies]
+python = ">=3.13"
+fastapi = ">=0.115.0"
+uvicorn = {extras = ["standard"], version = ">=0.32.0"}
+redis = ">=5.0.0"
+autodistil-kg = {path = "../Autodistil-KG", develop = true}
+
+[tool.poetry.group.dev.dependencies]
+pytest = "*"
+httpx = "*"
+pytest-asyncio = "*"
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
