@@ -6,7 +6,7 @@ readme = "README.md"
 packages = [{include = "autodistilkg_api", from = "src"}]
 
 [tool.poetry.dependencies]
-python = ">=3.13"
+python = ">=3.13,<3.14"
 fastapi = ">=0.115.0"
 uvicorn = {extras = ["standard"], version = ">=0.32.0"}
 redis = ">=5.0.0"

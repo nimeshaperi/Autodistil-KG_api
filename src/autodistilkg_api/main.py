@@ -2,11 +2,90 @@
 FastAPI app: REST endpoints and WebSocket for Autodistil-KG pipelines.
 WebSocket runs use a Redis queue + pub/sub when Redis is available (same dependency as graph traverser).
 """
+# =============================================================================
+# CRITICAL: Disable unsloth/torch.compile BEFORE any other imports
+# This must be at the very top to prevent PyTorch compatibility issues
+# (cuda.cutlass_epilogue_fusion_enabled was removed in newer PyTorch versions)
+# =============================================================================
+import os
+import shutil
+from pathlib import Path
+
+# Force disable torch.compile in unsloth (use = not setdefault to override)
+os.environ["UNSLOTH_COMPILE_DISABLE"] = "1"
+os.environ["TORCH_COMPILE_DISABLE"] = "1"
+
+# Clear any stale unsloth compiled cache that may contain incompatible torch.compile options
+_cache_dirs_to_clear = [
+    Path("/tmp/unsloth_compiled_cache"),
+    Path.cwd() / "unsloth_compiled_cache",
+    Path(__file__).parent.parent.parent / "unsloth_compiled_cache",
+]
+for _cache_dir in _cache_dirs_to_clear:
+    if _cache_dir.exists():
+        try:
+            shutil.rmtree(_cache_dir)
+        except Exception:
+            pass
+
+# Patch torch's _TorchCompileInductorWrapper to silently ignore unknown options
+# This is needed because unsloth's cached compiled files may reference options
+# that were removed in newer PyTorch versions (e.g., cuda.cutlass_epilogue_fusion_enabled)
+def _patch_torch_compile_wrapper():
+    """Patch _TorchCompileInductorWrapper.apply_options to skip unknown options instead of raising."""
+    try:
+        import torch
+        wrapper_class = getattr(torch, "_TorchCompileInductorWrapper", None)
+        if wrapper_class is None:
+            return
+        
+        _original_apply_options = wrapper_class.apply_options
+        
+        def _patched_apply_options(self, options):
+            if not options:
+                return
+            # Get known options from current config
+            from torch._inductor import config as inductor_config
+            
+            def get_known_keys(cfg, prefix=""):
+                keys = set()
+                for key in dir(cfg):
+                    if key.startswith("_"):
+                        continue
+                    full_key = f"{prefix}{key}" if prefix else key
+                    val = getattr(cfg, key, None)
+                    if hasattr(val, "__dict__") and not callable(val) and not isinstance(val, (str, int, float, bool, list, dict, type(None))):
+                        # It's a nested config section
+                        keys.update(get_known_keys(val, f"{full_key}."))
+                    else:
+                        keys.add(full_key)
+                return keys
+            
+            try:
+                known_keys = get_known_keys(inductor_config)
+            except Exception:
+                known_keys = set()
+            
+            # Filter options to only include known keys
+            filtered_options = {k: v for k, v in options.items() if k in known_keys}
+            
+            if filtered_options:
+                try:
+                    _original_apply_options(self, filtered_options)
+                except RuntimeError:
+                    # If it still fails, just skip
+                    pass
+        
+        wrapper_class.apply_options = _patched_apply_options
+    except Exception:
+        pass
+
+_patch_torch_compile_wrapper()
+
 import asyncio
 import concurrent.futures
 import json
 import logging
-import os
 import threading
 import uuid
 from pathlib import Path
@@ -87,6 +166,42 @@ _redis_available = False
 _worker_stop = threading.Event()
 
 
+class RedisLogHandler(logging.Handler):
+    """Custom logging handler that publishes log messages to a Redis channel."""
+    
+    def __init__(self, redis_client, channel: str, level=logging.INFO):
+        super().__init__(level)
+        self.redis_client = redis_client
+        self.channel = channel
+        # Only capture logs from pipeline-related modules
+        self.allowed_loggers = {
+            "autodistil_kg", "unsloth", "trl", "transformers", "datasets",
+            "unsloth.trainer", "autodistil_kg.finetuner", "autodistil_kg.pipeline",
+        }
+    
+    def emit(self, record: logging.LogRecord):
+        try:
+            # Filter to only relevant loggers
+            logger_name = record.name
+            is_allowed = any(logger_name.startswith(prefix) for prefix in self.allowed_loggers)
+            if not is_allowed:
+                return
+            
+            msg = self.format(record)
+            # Skip very long messages (e.g., progress bars with many characters)
+            if len(msg) > 500:
+                msg = msg[:497] + "..."
+            
+            self.redis_client.publish(self.channel, json.dumps({
+                "event": "log",
+                "level": record.levelname,
+                "logger": record.name,
+                "message": msg,
+            }))
+        except Exception:
+            pass  # Don't let logging errors break the pipeline
+
+
 def _pipeline_worker_loop() -> None:
     """Background thread: BRPOP from Redis queue, run pipeline, publish events to pipeline:run:{run_id}."""
     global _run_store
@@ -111,6 +226,13 @@ def _pipeline_worker_loop() -> None:
             logger.info("Pipeline worker picked up job run_id=%s stages=%s", run_id, config_dict.get("run_stages"))
             _run_store[run_id] = {"status": "running", "context": None, "results": None, "error": None}
             channel = pipeline_run_channel(run_id)
+            
+            # Set up log streaming to Redis for this run
+            log_handler = RedisLogHandler(r, channel)
+            log_handler.setFormatter(logging.Formatter("%(message)s"))
+            root_logger = logging.getLogger()
+            root_logger.addHandler(log_handler)
+            
             try:
                 config = config_from_dict(config_dict, base_dir)
                 pipeline = Pipeline(config)
@@ -121,6 +243,7 @@ def _pipeline_worker_loop() -> None:
                 results: List[Dict[str, Any]] = []
                 for name in ordered:
                     r.publish(channel, json.dumps({"event": "stage_start", "stage": name}))
+                    r.publish(channel, json.dumps({"event": "log", "level": "INFO", "logger": "pipeline", "message": f"Starting stage: {name}"}))
                     try:
                         result = pipeline.run_stage(name, context)
                         results.append({"success": result.success, "error": result.error, "metadata": result.metadata or {}})
@@ -131,6 +254,10 @@ def _pipeline_worker_loop() -> None:
                             "error": result.error,
                             "metadata": result.metadata or {},
                         }))
+                        if result.success:
+                            r.publish(channel, json.dumps({"event": "log", "level": "INFO", "logger": "pipeline", "message": f"Stage {name} completed successfully"}))
+                        else:
+                            r.publish(channel, json.dumps({"event": "log", "level": "ERROR", "logger": "pipeline", "message": f"Stage {name} failed: {result.error}"}))
                         if not result.success:
                             break
                     except Exception as e:
@@ -143,6 +270,7 @@ def _pipeline_worker_loop() -> None:
                             "error": str(e),
                             "metadata": {},
                         }))
+                        r.publish(channel, json.dumps({"event": "log", "level": "ERROR", "logger": "pipeline", "message": f"Stage {name} exception: {str(e)}"}))
                         break
                 success = all(x["success"] for x in results)
                 r.publish(channel, json.dumps({
@@ -160,6 +288,9 @@ def _pipeline_worker_loop() -> None:
                 _run_store[run_id]["status"] = "failed"
                 _run_store[run_id]["error"] = str(e)
                 r.publish(channel, json.dumps({"event": "error", "message": str(e)}))
+            finally:
+                # Remove the log handler to avoid duplicate logs in future runs
+                root_logger.removeHandler(log_handler)
         except redis.ConnectionError:
             if not _worker_stop.is_set():
                 logger.warning("Pipeline worker Redis connection lost; reconnecting on next iteration")

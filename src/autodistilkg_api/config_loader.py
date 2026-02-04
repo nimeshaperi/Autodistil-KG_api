@@ -186,7 +186,7 @@ def config_from_dict(data: Dict[str, Any], base_dir: Path) -> PipelineConfig:
         if not d:
             return None
         return FineTunerStageConfig(
-            model_name=d.get("model_name", "unsloth/gemma-3-270m-it"),
+            model_name=d.get("model_name", "unsloth/gemma-2-2b-it"),
             model_type=d.get("model_type"),
             train_data_path=_resolve_path(d.get("train_data_path"), base_dir),
             eval_data_path=_resolve_path(d.get("eval_data_path"), base_dir),

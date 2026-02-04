@@ -11,11 +11,18 @@ cd Autodistil-KG_api
 poetry install
 ```
 
+This installs `autodistil-kg` with the **finetune** extra (unsloth, trl, transformers, datasets). For finetuning to work, you also need Python development headers:
+
+- **Ubuntu/Debian**: `sudo apt install python3-dev` or `python3.13-dev`
+- **Fedora**: `sudo dnf install python3-devel`
+
 ## Run
 
 ```bash
-poetry run uvicorn autodistilkg_api.main:app --reload --host 0.0.0.0 --port 8000
+poetry run uvicorn autodistilkg_api.main:app --reload --host 0.0.0.0 --port 8000 --reload-exclude "unsloth_compiled_cache/*"
 ```
+
+> **Note**: The `--reload-exclude` flag is important! Without it, Unsloth creates cache files during training that trigger server reloads and break WebSocket connections.
 
 Config paths in the pipeline JSON are resolved relative to a **workspace** directory (default: `Autodistil-KG_api/workspace`). To use data from the Autodistil-KG repo, set:
 
@@ -44,6 +51,10 @@ When Redis is available, WebSocket pipeline runs are **enqueued** and a backgrou
 
 ## WebSocket events (server → client)
 
-- `{"event": "stage_start", "stage": "chatml_converter"}`
-- `{"event": "stage_end", "stage": "chatml_converter", "success": true, "metadata": {...}}`
-- `{"event": "done", "success": true, "context": {...}, "results": [...]}`
+- `{"event": "run_start", "run_id": "uuid"}` — Pipeline run started
+- `{"event": "pipeline_start", "stages": ["stage1", "stage2"]}` — Stages list
+- `{"event": "stage_start", "stage": "chatml_converter"}` — Stage started
+- `{"event": "stage_end", "stage": "chatml_converter", "success": true, "metadata": {...}}` — Stage completed
+- `{"event": "log", "level": "INFO", "logger": "pipeline", "message": "..."}` — Log message from pipeline (training progress, etc.)
+- `{"event": "done", "success": true, "context": {...}, "results": [...]}` — Pipeline completed
+- `{"event": "error", "message": "..."}` — Error occurred
