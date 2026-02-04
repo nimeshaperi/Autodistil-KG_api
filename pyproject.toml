@@ -10,7 +10,7 @@ python = ">=3.13"
 fastapi = ">=0.115.0"
 uvicorn = {extras = ["standard"], version = ">=0.32.0"}
 redis = ">=5.0.0"
-autodistil-kg = {path = "../Autodistil-KG", develop = true}
+autodistil-kg = {path = "../Autodistil-KG_core", develop = true, extras = ["finetune"]}
 
 [tool.poetry.group.dev.dependencies]
 pytest = "*"
