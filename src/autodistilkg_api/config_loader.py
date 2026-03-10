@@ -200,11 +200,25 @@ def config_from_dict(data: Dict[str, Any], base_dir: Path) -> PipelineConfig:
     ev = data.get("evaluator")
     evaluator = None
     if ev:
+        graph_rag_config = None
+        if ev.get("graph_rag_enabled") and ev.get("graph_rag_config"):
+            graph_rag_config = ev["graph_rag_config"]
+
         evaluator = EvaluatorStageConfig(
             model_path=_resolve_path(ev.get("model_path"), base_dir),
             eval_dataset_path=_resolve_path(ev.get("eval_dataset_path"), base_dir),
             output_report_path=_resolve_path(ev.get("output_report_path"), base_dir),
             metrics=ev.get("metrics"),
+            evalg_mode=ev.get("evalg_mode", "internal"),
+            base_model_provider=ev.get("base_model_provider") or None,
+            base_model_name=ev.get("base_model_name") or None,
+            base_model_api_key=ev.get("base_model_api_key") or None,
+            base_model_base_url=ev.get("base_model_base_url") or None,
+            graph_rag_config=graph_rag_config,
+            judge_provider=ev.get("judge_provider") or None,
+            judge_model=ev.get("judge_model") or None,
+            judge_api_key=ev.get("judge_api_key") or None,
+            max_eval_samples=ev.get("max_eval_samples"),
             additional_params=ev.get("additional_params", {}),
         )
 
