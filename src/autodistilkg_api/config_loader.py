@@ -147,6 +147,8 @@ def _parse_graph_traverser_config(gt_data: dict, base: Path) -> GraphTraverserSt
         relationship_types=t.get("relationship_types"),
         node_labels=t.get("node_labels"),
         seed_node_ids=t.get("seed_node_ids"),
+        reasoning_depth=t.get("reasoning_depth", 2),
+        max_paths_per_node=t.get("max_paths_per_node", 15),
     )
 
     d = gt_data.get("dataset") or {}
