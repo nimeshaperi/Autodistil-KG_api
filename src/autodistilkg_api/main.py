@@ -724,8 +724,26 @@ def get_run_artifact(run_id: str, artifact_key: str):
 async def _ws_run_via_redis(websocket: WebSocket, config_dict: Dict[str, Any]) -> None:
     """Enqueue job to Redis, subscribe to run_id channel, forward events to client until done/error."""
     run_id = str(uuid.uuid4())
-    # _prepare_run_dir is called by the worker, but we still include run_id
-    # in the job so the worker can create the run directory
+    # Pre-compute stages so they're available immediately via REST polling
+    try:
+        _tmp_cfg = config_from_dict(config_dict, WORKSPACE)
+        _tmp_pipe = Pipeline(_tmp_cfg)
+        _tmp_order = _tmp_cfg.run_stages or list(_tmp_pipe.available_stages)
+        pre_stages = [s for s in STAGE_ORDER if s in _tmp_order and s in _tmp_pipe.available_stages]
+    except Exception:
+        pre_stages = config_dict.get("run_stages", [])
+
+    # Register in _run_store immediately so REST polling works before worker picks up the job
+    _run_store[run_id] = {
+        "status": "running",
+        "context": None,
+        "results": None,
+        "error": None,
+        "stages": pre_stages,
+        "current_stage": pre_stages[0] if pre_stages else None,
+        "events": [],
+    }
+
     job = {
         "run_id": run_id,
         "config": config_dict,
@@ -745,6 +763,9 @@ async def _ws_run_via_redis(websocket: WebSocket, config_dict: Dict[str, Any]) -
                 if msg["type"] != "message":
                     continue
                 payload = json.loads(msg["data"])
+                # Also store events in _run_store for REST replay
+                if run_id in _run_store:
+                    _run_store[run_id].setdefault("events", []).append(payload)
                 await websocket.send_json(payload)
                 if payload.get("event") in ("done", "error"):
                     break
