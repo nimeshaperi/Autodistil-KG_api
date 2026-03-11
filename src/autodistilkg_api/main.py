@@ -290,7 +290,7 @@ def _pipeline_worker_loop() -> None:
             config_dict = job["config"]
             run_dir = _prepare_run_dir(run_id, config_dict)
             logger.info("Pipeline worker picked up job run_id=%s stages=%s dir=%s", run_id, config_dict.get("run_stages"), run_dir)
-            _run_store[run_id] = {"status": "running", "context": None, "results": None, "error": None}
+            _run_store[run_id] = {"status": "running", "context": None, "results": None, "error": None, "stages": [], "current_stage": None, "events": []}
             channel = pipeline_run_channel(run_id)
 
             # Set up log streaming to Redis for this run
@@ -299,52 +299,59 @@ def _pipeline_worker_loop() -> None:
             root_logger = logging.getLogger()
             root_logger.addHandler(log_handler)
 
+            def _store_event(evt: Dict[str, Any]) -> None:
+                """Store event in run store for replay and publish to Redis."""
+                _run_store[run_id].setdefault("events", []).append(evt)
+                r.publish(channel, json.dumps(evt))
+
             try:
                 config = config_from_dict(config_dict, run_dir)
                 pipeline = Pipeline(config)
                 context = context_from_config(config)
                 run_order = config.run_stages or list(pipeline.available_stages)
                 ordered = [s for s in STAGE_ORDER if s in run_order and s in pipeline.available_stages]
-                r.publish(channel, json.dumps({"event": "pipeline_start", "stages": ordered}))
+                _run_store[run_id]["stages"] = ordered
+                _store_event({"event": "pipeline_start", "stages": ordered})
                 results: List[Dict[str, Any]] = []
                 for name in ordered:
-                    r.publish(channel, json.dumps({"event": "stage_start", "stage": name}))
-                    r.publish(channel, json.dumps({"event": "log", "level": "INFO", "logger": "pipeline", "message": f"Starting stage: {name}"}))
+                    _run_store[run_id]["current_stage"] = name
+                    _store_event({"event": "stage_start", "stage": name})
+                    _store_event({"event": "log", "level": "INFO", "logger": "pipeline", "message": f"Starting stage: {name}"})
                     try:
                         result = pipeline.run_stage(name, context)
                         results.append({"success": result.success, "error": result.error, "metadata": result.metadata or {}})
-                        r.publish(channel, json.dumps({
+                        _store_event({
                             "event": "stage_end",
                             "stage": name,
                             "success": result.success,
                             "error": result.error,
                             "metadata": result.metadata or {},
-                        }))
+                        })
                         if result.success:
-                            r.publish(channel, json.dumps({"event": "log", "level": "INFO", "logger": "pipeline", "message": f"Stage {name} completed successfully"}))
+                            _store_event({"event": "log", "level": "INFO", "logger": "pipeline", "message": f"Stage {name} completed successfully"})
                         else:
-                            r.publish(channel, json.dumps({"event": "log", "level": "ERROR", "logger": "pipeline", "message": f"Stage {name} failed: {result.error}"}))
+                            _store_event({"event": "log", "level": "ERROR", "logger": "pipeline", "message": f"Stage {name} failed: {result.error}"})
                         if not result.success:
                             break
                     except Exception as e:
                         logger.exception("Stage %s failed", name)
                         results.append({"success": False, "error": str(e), "metadata": {}})
-                        r.publish(channel, json.dumps({
+                        _store_event({
                             "event": "stage_end",
                             "stage": name,
                             "success": False,
                             "error": str(e),
                             "metadata": {},
-                        }))
-                        r.publish(channel, json.dumps({"event": "log", "level": "ERROR", "logger": "pipeline", "message": f"Stage {name} exception: {str(e)}"}))
+                        })
+                        _store_event({"event": "log", "level": "ERROR", "logger": "pipeline", "message": f"Stage {name} exception: {str(e)}"})
                         break
                 success = all(x["success"] for x in results)
-                r.publish(channel, json.dumps({
+                _store_event({
                     "event": "done",
                     "success": success,
                     "context": context.to_dict(),
                     "results": results,
-                }))
+                })
                 _run_store[run_id]["status"] = "completed" if success else "failed"
                 _run_store[run_id]["context"] = context.to_dict()
                 _run_store[run_id]["results"] = results
@@ -383,7 +390,11 @@ class PipelineRunResultResponse(BaseModel):
     current_stage: Optional[str] = None  # e.g. "graph_traverser" while running
 
 
-def _run_pipeline_sync(config_dict: Dict[str, Any], base_dir: Path) -> tuple[PipelineContext, list[StageResult]]:
+def _run_pipeline_sync(
+    config_dict: Dict[str, Any],
+    base_dir: Path,
+    run_id: Optional[str] = None,
+) -> tuple[PipelineContext, list[StageResult]]:
     """Build config, pipeline, and run to completion. Returns (context, results)."""
     config = config_from_dict(config_dict, base_dir)
     pipeline = Pipeline(config)
@@ -392,8 +403,19 @@ def _run_pipeline_sync(config_dict: Dict[str, Any], base_dir: Path) -> tuple[Pip
     ordered = [s for s in STAGE_ORDER if s in run_order and s in pipeline.available_stages]
     results: List[StageResult] = []
     for name in ordered:
+        if run_id and run_id in _run_store:
+            _run_store[run_id]["current_stage"] = name
+            _run_store[run_id]["events"].append({"event": "stage_start", "stage": name})
         result = pipeline.run_stage(name, context)
         results.append(result)
+        if run_id and run_id in _run_store:
+            _run_store[run_id]["events"].append({
+                "event": "stage_end",
+                "stage": name,
+                "success": result.success,
+                "error": result.error,
+                "metadata": result.metadata or {},
+            })
         if not result.success:
             break
     return context, results
@@ -553,20 +575,25 @@ def run_pipeline(
             "error": None,
             "stages": ordered,
             "current_stage": ordered[0] if ordered else None,
+            "events": [],
         }
 
         def task():
             try:
-                context, results = _run_pipeline_sync(body, run_dir)
+                _run_store[run_id]["events"].append({"event": "pipeline_start", "stages": ordered})
+                context, results = _run_pipeline_sync(body, run_dir, run_id=run_id)
                 _run_store[run_id]["status"] = "completed"
+                _run_store[run_id]["current_stage"] = None
                 _run_store[run_id]["context"] = context.to_dict()
                 _run_store[run_id]["results"] = [
                     {"success": r.success, "error": r.error, "metadata": r.metadata} for r in results
                 ]
+                _run_store[run_id]["events"].append({"event": "done", "success": all(r.success for r in results)})
             except Exception as e:
                 logger.exception("Async pipeline run failed")
                 _run_store[run_id]["status"] = "failed"
                 _run_store[run_id]["error"] = str(e)
+                _run_store[run_id]["events"].append({"event": "error", "message": str(e)})
 
         threading.Thread(target=task, daemon=True).start()
         return PipelineRunResultResponse(run_id=run_id, status="running", success=True)
@@ -650,6 +677,18 @@ def get_run_status(run_id: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/pipelines/runs/{run_id}/events")
+def get_run_events(run_id: str, since: int = Query(0, ge=0)):
+    """Return stored events for a run (for replaying progress on historical runs).
+
+    Use ``?since=N`` to get only events after index N (for incremental polling).
+    """
+    if run_id not in _run_store:
+        raise HTTPException(status_code=404, detail="Run not found")
+    events = _run_store[run_id].get("events", [])
+    return {"run_id": run_id, "events": events[since:], "total": len(events)}
+
+
 _ARTIFACT_KEYS = {
     "chatml": "chatml_dataset_path",
     "prepared": "prepared_dataset_path",
@@ -719,7 +758,7 @@ async def _ws_run_via_redis(websocket: WebSocket, config_dict: Dict[str, Any]) -
 async def _ws_run_in_process(websocket: WebSocket, config_dict: Dict[str, Any]) -> None:
     """Run pipeline in-process and send events directly (no Redis)."""
     run_id = str(uuid.uuid4())
-    _run_store[run_id] = {"status": "running", "context": None, "results": None, "error": None}
+    _run_store[run_id] = {"status": "running", "context": None, "results": None, "error": None, "stages": [], "current_stage": None, "events": []}
     await websocket.send_json({"event": "run_start", "run_id": run_id})
     run_dir = _prepare_run_dir(run_id, config_dict)
     config = config_from_dict(config_dict, run_dir)
@@ -727,8 +766,10 @@ async def _ws_run_in_process(websocket: WebSocket, config_dict: Dict[str, Any]) 
     context = context_from_config(config)
     run_order = config.run_stages or list(pipeline.available_stages)
     ordered = [s for s in STAGE_ORDER if s in run_order and s in pipeline.available_stages]
+    _run_store[run_id]["stages"] = ordered
     results: List[StageResult] = []
     await websocket.send_json({"event": "pipeline_start", "stages": ordered})
+    _run_store[run_id]["events"].append({"event": "pipeline_start", "stages": ordered})
 
     # Set up in-process log streaming via a thread-safe queue
     log_queue: import_queue.Queue = import_queue.Queue()
@@ -749,7 +790,9 @@ async def _ws_run_in_process(websocket: WebSocket, config_dict: Dict[str, Any]) 
     loop = asyncio.get_event_loop()
     try:
         for name in ordered:
+            _run_store[run_id]["current_stage"] = name
             await websocket.send_json({"event": "stage_start", "stage": name})
+            _run_store[run_id]["events"].append({"event": "stage_start", "stage": name})
             try:
                 result = await loop.run_in_executor(
                     get_executor(),
@@ -757,25 +800,29 @@ async def _ws_run_in_process(websocket: WebSocket, config_dict: Dict[str, Any]) 
                 )
                 await _drain_log_queue()
                 results.append(result)
-                await websocket.send_json({
+                stage_end_evt = {
                     "event": "stage_end",
                     "stage": name,
                     "success": result.success,
                     "error": result.error,
                     "metadata": result.metadata or {},
-                })
+                }
+                await websocket.send_json(stage_end_evt)
+                _run_store[run_id]["events"].append(stage_end_evt)
                 if not result.success:
                     break
             except Exception as e:
                 logger.exception("Stage %s failed", name)
                 await _drain_log_queue()
-                await websocket.send_json({
+                stage_end_evt = {
                     "event": "stage_end",
                     "stage": name,
                     "success": False,
                     "error": str(e),
                     "metadata": {},
-                })
+                }
+                await websocket.send_json(stage_end_evt)
+                _run_store[run_id]["events"].append(stage_end_evt)
                 results.append(StageResult(success=False, error=str(e)))
                 break
     finally:
