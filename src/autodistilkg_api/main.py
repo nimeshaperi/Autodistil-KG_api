@@ -514,13 +514,15 @@ def get_stages():
                 "description": "Compare finetuned model against base models and Graph RAG using configurable metrics.",
                 "config": {
                     "modes": [
-                        {"value": "internal", "label": "Internal (in-process)", "description": "Run evaluation in the API process using ROUGE and LLM judge."},
+                        {"value": "internal", "label": "Internal (in-process)", "description": "Run evaluation in the API process using DeepEval metrics."},
                         {"value": "cli", "label": "CLI (external command)", "description": "Invoke an external EvalG CLI command."},
                         {"value": "noop", "label": "No-op (stub report)", "description": "Emit a stub report without running actual evaluation."},
                     ],
                     "metrics": [
-                        {"value": "rouge", "label": "ROUGE (1/2/L)", "description": "Lexical overlap metrics comparing prediction against reference."},
-                        {"value": "llm_judge", "label": "LLM Judge", "description": "LLM rates predictions on accuracy, completeness, and relevance (1-5)."},
+                        {"value": "answer_relevancy", "label": "Answer Relevancy", "description": "DeepEval metric measuring how relevant the answer is to the question."},
+                        {"value": "correctness", "label": "Correctness (G-Eval)", "description": "LLM-based evaluation of accuracy, completeness, and relevance using DeepEval G-Eval."},
+                        {"value": "faithfulness", "label": "Faithfulness", "description": "DeepEval metric measuring factual consistency against the reference."},
+                        {"value": "hallucination", "label": "Hallucination Detection", "description": "DeepEval metric detecting hallucinated content (higher = less hallucination)."},
                     ],
                     "system_kinds": [
                         {"value": "distilled", "label": "Finetuned Model", "description": "The LoRA-adapted model from the finetuner stage."},
