@@ -86,6 +86,7 @@ import asyncio
 import concurrent.futures
 import json
 import logging
+import queue as import_queue
 import threading
 import uuid
 from pathlib import Path
@@ -103,6 +104,26 @@ from autodistil_kg.pipeline.interfaces import PipelineContext, StageResult
 
 from .config_loader import config_from_dict, context_from_config
 from .redis_client import REDIS_QUEUE_KEY, get_redis_url, pipeline_run_channel
+
+
+def _prepare_run_dir(run_id: str, config_dict: Dict[str, Any]) -> Path:
+    """Create a per-run workspace directory and inject run_id into config for isolation.
+
+    Returns the run-specific base directory.  All relative output paths will
+    resolve under ``WORKSPACE/runs/<run_id>/`` so concurrent runs never collide.
+    The Redis key_prefix for graph traversal is also made run-specific.
+    """
+    run_dir = WORKSPACE / "runs" / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    # Inject run-scoped Redis key prefix so visited-node sets don't collide
+    gt = config_dict.get("graph_traverser")
+    if gt and isinstance(gt, dict):
+        redis_cfg = gt.setdefault("redis", {})
+        if isinstance(redis_cfg, dict) and not redis_cfg.get("key_prefix"):
+            redis_cfg["key_prefix"] = f"run:{run_id}:gt:"
+
+    return run_dir
 
 logging.basicConfig(
     level=logging.INFO,
@@ -166,6 +187,42 @@ _redis_available = False
 _worker_stop = threading.Event()
 
 
+class QueueLogHandler(logging.Handler):
+    """Log handler that pushes structured events to a thread-safe queue for in-process WebSocket runs."""
+
+    def __init__(self, queue: "import_queue.Queue", level=logging.INFO):
+        super().__init__(level)
+        self.queue = queue
+        self.allowed_loggers = {
+            "autodistil_kg", "unsloth", "trl", "transformers", "datasets",
+            "unsloth.trainer", "autodistil_kg.finetuner", "autodistil_kg.pipeline",
+        }
+
+    def emit(self, record: logging.LogRecord):
+        try:
+            logger_name = record.name
+            is_allowed = any(logger_name.startswith(prefix) for prefix in self.allowed_loggers)
+            if not is_allowed:
+                return
+
+            traversal_event = getattr(record, "traversal_event", None)
+            if traversal_event and isinstance(traversal_event, dict):
+                self.queue.put({"event": "traversal_progress", **traversal_event})
+                return
+
+            msg = self.format(record)
+            if len(msg) > 500:
+                msg = msg[:497] + "..."
+            self.queue.put({
+                "event": "log",
+                "level": record.levelname,
+                "logger": record.name,
+                "message": msg,
+            })
+        except Exception:
+            pass
+
+
 class RedisLogHandler(logging.Handler):
     """Custom logging handler that publishes log messages to a Redis channel."""
     
@@ -186,12 +243,21 @@ class RedisLogHandler(logging.Handler):
             is_allowed = any(logger_name.startswith(prefix) for prefix in self.allowed_loggers)
             if not is_allowed:
                 return
-            
+
+            # Check for structured traversal events (emitted by GraphTraverserAgent)
+            traversal_event = getattr(record, "traversal_event", None)
+            if traversal_event and isinstance(traversal_event, dict):
+                self.redis_client.publish(self.channel, json.dumps({
+                    "event": "traversal_progress",
+                    **traversal_event,
+                }))
+                return
+
             msg = self.format(record)
             # Skip very long messages (e.g., progress bars with many characters)
             if len(msg) > 500:
                 msg = msg[:497] + "..."
-            
+
             self.redis_client.publish(self.channel, json.dumps({
                 "event": "log",
                 "level": record.levelname,
@@ -222,19 +288,19 @@ def _pipeline_worker_loop() -> None:
             job = json.loads(raw)
             run_id = job["run_id"]
             config_dict = job["config"]
-            base_dir = Path(job["base_dir"])
-            logger.info("Pipeline worker picked up job run_id=%s stages=%s", run_id, config_dict.get("run_stages"))
+            run_dir = _prepare_run_dir(run_id, config_dict)
+            logger.info("Pipeline worker picked up job run_id=%s stages=%s dir=%s", run_id, config_dict.get("run_stages"), run_dir)
             _run_store[run_id] = {"status": "running", "context": None, "results": None, "error": None}
             channel = pipeline_run_channel(run_id)
-            
+
             # Set up log streaming to Redis for this run
             log_handler = RedisLogHandler(r, channel)
             log_handler.setFormatter(logging.Formatter("%(message)s"))
             root_logger = logging.getLogger()
             root_logger.addHandler(log_handler)
-            
+
             try:
-                config = config_from_dict(config_dict, base_dir)
+                config = config_from_dict(config_dict, run_dir)
                 pipeline = Pipeline(config)
                 context = context_from_config(config)
                 run_order = config.run_stages or list(pipeline.available_stages)
@@ -470,11 +536,11 @@ def run_pipeline(
     Paths in config are relative to the API workspace directory.
     Use ?async=true to run in background and get run_id; then GET /pipelines/runs/{run_id} for result.
     """
-    base_dir = WORKSPACE
     if async_run:
         run_id = str(uuid.uuid4())
+        run_dir = _prepare_run_dir(run_id, body)
         try:
-            config = config_from_dict(body, base_dir)
+            config = config_from_dict(body, run_dir)
             pipeline = Pipeline(config)
             run_order = config.run_stages or list(pipeline.available_stages)
             ordered = [s for s in STAGE_ORDER if s in run_order and s in pipeline.available_stages]
@@ -491,7 +557,7 @@ def run_pipeline(
 
         def task():
             try:
-                context, results = _run_pipeline_sync(body, base_dir)
+                context, results = _run_pipeline_sync(body, run_dir)
                 _run_store[run_id]["status"] = "completed"
                 _run_store[run_id]["context"] = context.to_dict()
                 _run_store[run_id]["results"] = [
@@ -506,7 +572,9 @@ def run_pipeline(
         return PipelineRunResultResponse(run_id=run_id, status="running", success=True)
 
     try:
-        context, results = _run_pipeline_sync(body, base_dir)
+        sync_run_id = str(uuid.uuid4())
+        sync_run_dir = _prepare_run_dir(sync_run_id, body)
+        context, results = _run_pipeline_sync(body, sync_run_dir)
         success = all(r.success for r in results)
         return PipelineRunResultResponse(
             run_id="",
@@ -519,6 +587,22 @@ def run_pipeline(
     except Exception as e:
         logger.exception("Pipeline run failed")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/pipelines/runs")
+def list_runs():
+    """List all known pipeline runs (newest first)."""
+    runs = []
+    for run_id, rec in _run_store.items():
+        runs.append({
+            "run_id": run_id,
+            "status": rec.get("status", "unknown"),
+            "error": rec.get("error"),
+            "stages": rec.get("stages"),
+        })
+    # Newest first (dict insertion order in Python 3.7+)
+    runs.reverse()
+    return {"runs": runs}
 
 
 def _make_json_safe(obj: Any) -> Any:
@@ -601,10 +685,11 @@ def get_run_artifact(run_id: str, artifact_key: str):
 async def _ws_run_via_redis(websocket: WebSocket, config_dict: Dict[str, Any]) -> None:
     """Enqueue job to Redis, subscribe to run_id channel, forward events to client until done/error."""
     run_id = str(uuid.uuid4())
+    # _prepare_run_dir is called by the worker, but we still include run_id
+    # in the job so the worker can create the run directory
     job = {
         "run_id": run_id,
         "config": config_dict,
-        "base_dir": str(WORKSPACE),
     }
     red = aioredis.from_url(get_redis_url(), decode_responses=True)
     try:
@@ -636,43 +721,67 @@ async def _ws_run_in_process(websocket: WebSocket, config_dict: Dict[str, Any]) 
     run_id = str(uuid.uuid4())
     _run_store[run_id] = {"status": "running", "context": None, "results": None, "error": None}
     await websocket.send_json({"event": "run_start", "run_id": run_id})
-    base_dir = WORKSPACE
-    config = config_from_dict(config_dict, base_dir)
+    run_dir = _prepare_run_dir(run_id, config_dict)
+    config = config_from_dict(config_dict, run_dir)
     pipeline = Pipeline(config)
     context = context_from_config(config)
     run_order = config.run_stages or list(pipeline.available_stages)
     ordered = [s for s in STAGE_ORDER if s in run_order and s in pipeline.available_stages]
     results: List[StageResult] = []
     await websocket.send_json({"event": "pipeline_start", "stages": ordered})
-    loop = asyncio.get_event_loop()
-    for name in ordered:
-        await websocket.send_json({"event": "stage_start", "stage": name})
-        try:
-            result = await loop.run_in_executor(
-                get_executor(),
-                lambda n=name: pipeline.run_stage(n, context),
-            )
-            results.append(result)
-            await websocket.send_json({
-                "event": "stage_end",
-                "stage": name,
-                "success": result.success,
-                "error": result.error,
-                "metadata": result.metadata or {},
-            })
-            if not result.success:
+
+    # Set up in-process log streaming via a thread-safe queue
+    log_queue: import_queue.Queue = import_queue.Queue()
+    log_handler = QueueLogHandler(log_queue)
+    log_handler.setFormatter(logging.Formatter("%(message)s"))
+    root_logger = logging.getLogger()
+    root_logger.addHandler(log_handler)
+
+    async def _drain_log_queue():
+        """Drain queued log/traversal_progress events and send to WebSocket."""
+        while True:
+            try:
+                payload = log_queue.get_nowait()
+                await websocket.send_json(payload)
+            except import_queue.Empty:
                 break
-        except Exception as e:
-            logger.exception("Stage %s failed", name)
-            await websocket.send_json({
-                "event": "stage_end",
-                "stage": name,
-                "success": False,
-                "error": str(e),
-                "metadata": {},
-            })
-            results.append(StageResult(success=False, error=str(e)))
-            break
+
+    loop = asyncio.get_event_loop()
+    try:
+        for name in ordered:
+            await websocket.send_json({"event": "stage_start", "stage": name})
+            try:
+                result = await loop.run_in_executor(
+                    get_executor(),
+                    lambda n=name: pipeline.run_stage(n, context),
+                )
+                await _drain_log_queue()
+                results.append(result)
+                await websocket.send_json({
+                    "event": "stage_end",
+                    "stage": name,
+                    "success": result.success,
+                    "error": result.error,
+                    "metadata": result.metadata or {},
+                })
+                if not result.success:
+                    break
+            except Exception as e:
+                logger.exception("Stage %s failed", name)
+                await _drain_log_queue()
+                await websocket.send_json({
+                    "event": "stage_end",
+                    "stage": name,
+                    "success": False,
+                    "error": str(e),
+                    "metadata": {},
+                })
+                results.append(StageResult(success=False, error=str(e)))
+                break
+    finally:
+        root_logger.removeHandler(log_handler)
+        await _drain_log_queue()
+
     success = all(r.success for r in results)
     _run_store[run_id]["status"] = "completed" if success else "failed"
     _run_store[run_id]["context"] = context.to_dict()
