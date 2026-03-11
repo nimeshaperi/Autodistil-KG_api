@@ -909,3 +909,172 @@ async def websocket_endpoint(websocket: WebSocket):
             await websocket.send_json({"event": "error", "message": str(e)})
         except Exception:
             pass
+
+
+# =============================================================================
+# Inference / Prompting endpoints
+# =============================================================================
+
+class InferenceLLMRequest(BaseModel):
+    """Prompt a base model via any supported LLM provider."""
+    provider: str  # openai, claude, gemini, ollama, vllm
+    model: Optional[str] = None
+    api_key: Optional[str] = None
+    base_url: Optional[str] = None
+    project_id: Optional[str] = None
+    location: Optional[str] = None
+    credentials_path: Optional[str] = None
+    messages: List[Dict[str, str]]  # [{role, content}, ...]
+    temperature: float = 0.7
+    max_tokens: Optional[int] = None
+
+
+class InferenceGraphRAGRequest(BaseModel):
+    """Query through Graph RAG."""
+    question: str
+    neo4j_uri: str = "bolt://localhost:7687"
+    neo4j_user: str = "neo4j"
+    neo4j_password: str = "password"
+    neo4j_database: str = "neo4j"
+    llm_api_key: Optional[str] = None
+    llm_model: str = "gpt-4"
+    embedding_api_key: Optional[str] = None
+    embedding_model: str = "text-embedding-3-small"
+    retrievers: List[str] = ["vector", "cypher", "synonym"]
+    num_agents: int = 1
+    similarity_top_k: int = 5
+
+
+# Cache for GraphRAG engines (keyed by config hash)
+_graphrag_engines: Dict[str, Any] = {}
+
+
+@app.post("/inference/llm")
+async def inference_llm(body: InferenceLLMRequest):
+    """Prompt a base model via any supported LLM provider."""
+    try:
+        from autodistil_kg.llm.config import LLMConfig as CoreLLMConfig
+        from autodistil_kg.llm.factory import create_llm_client
+        from autodistil_kg.llm.interface import LLMMessage
+
+        config = CoreLLMConfig(
+            provider=body.provider,
+            api_key=body.api_key,
+            model=body.model,
+            base_url=body.base_url,
+            project_id=body.project_id,
+            location=body.location,
+            credentials_path=body.credentials_path,
+        )
+        client = create_llm_client(config)
+        messages = [LLMMessage(role=m["role"], content=m["content"]) for m in body.messages]
+
+        loop = asyncio.get_event_loop()
+        response = await loop.run_in_executor(
+            get_executor(),
+            lambda: client.generate(messages, temperature=body.temperature, max_tokens=body.max_tokens),
+        )
+        return {"response": response, "provider": body.provider, "model": body.model}
+    except Exception as e:
+        logger.exception("LLM inference failed")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/inference/graphrag")
+async def inference_graphrag(body: InferenceGraphRAGRequest):
+    """Query through Graph RAG engine."""
+    try:
+        from autodistil_kg_graphrag.config import (
+            GraphRAGConfig, Neo4jConfig as GRAGNeo4jConfig, LLMConfig as GRAGLLMConfig,
+            EmbeddingConfig, RetrieverConfig, RetrieverType,
+        )
+        from autodistil_kg_graphrag.query_engine import GraphRAGEngine
+
+        # Build config from request
+        neo4j_cfg = GRAGNeo4jConfig(
+            uri=body.neo4j_uri,
+            user=body.neo4j_user,
+            password=body.neo4j_password,
+            database=body.neo4j_database,
+        )
+        llm_cfg = GRAGLLMConfig(
+            api_key=body.llm_api_key or "",
+            model=body.llm_model,
+        )
+        embed_cfg = EmbeddingConfig(
+            api_key=body.embedding_api_key or body.llm_api_key or "",
+            model=body.embedding_model,
+        )
+        retriever_types = []
+        for r in body.retrievers:
+            try:
+                retriever_types.append(RetrieverType(r))
+            except ValueError:
+                pass
+        retriever_cfg = RetrieverConfig(
+            enabled=retriever_types or [RetrieverType.VECTOR, RetrieverType.CYPHER, RetrieverType.SYNONYM],
+            similarity_top_k=body.similarity_top_k,
+            num_agents=body.num_agents,
+        )
+        config = GraphRAGConfig(
+            neo4j=neo4j_cfg,
+            llm=llm_cfg,
+            embedding=embed_cfg,
+            retriever=retriever_cfg,
+        )
+
+        # Create a cache key based on connection params
+        cache_key = f"{body.neo4j_uri}:{body.neo4j_database}:{body.llm_model}:{body.embedding_model}:{body.num_agents}"
+        engine = _graphrag_engines.get(cache_key)
+        if engine is None:
+            engine = GraphRAGEngine(config)
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(get_executor(), engine.initialise)
+            _graphrag_engines[cache_key] = engine
+
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(get_executor(), lambda: engine.query(body.question))
+
+        return {
+            "answer": result.answer,
+            "source_nodes": result.source_nodes,
+            "metadata": result.metadata,
+        }
+    except Exception as e:
+        logger.exception("GraphRAG inference failed")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/inference/models")
+def list_available_models():
+    """List finetuned models from completed pipeline runs."""
+    models = []
+    for run_id, rec in _run_store.items():
+        if rec.get("status") != "completed":
+            continue
+        ctx = rec.get("context") or {}
+        model_path = ctx.get("model_output_path")
+        if model_path and Path(model_path).exists():
+            models.append({
+                "run_id": run_id,
+                "model_path": model_path,
+                "label": f"Run {run_id[:8]} finetuned model",
+            })
+    # Also scan workspace for model directories
+    runs_dir = WORKSPACE / "runs"
+    if runs_dir.exists():
+        for run_dir in runs_dir.iterdir():
+            if not run_dir.is_dir():
+                continue
+            # Look for common finetuned model output dirs
+            for candidate in ["output/finetuned", "finetuner_output"]:
+                model_dir = run_dir / candidate
+                if model_dir.exists() and (model_dir / "config.json").exists():
+                    rid = run_dir.name
+                    if not any(m["run_id"] == rid for m in models):
+                        models.append({
+                            "run_id": rid,
+                            "model_path": str(model_dir),
+                            "label": f"Run {rid[:8]} finetuned model",
+                        })
+    return {"models": models}
